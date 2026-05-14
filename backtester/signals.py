@@ -1,165 +1,198 @@
-# backtester/signals.py
 """
-Signal generation module.
-All functions take a prices DataFrame and return a signal DataFrame
-of the same shape with values in [-1, 0, +1] or continuous weights.
+backtester/signals.py
+
+Signal generation functions.
+
+All functions:
+  - Accept a prices DataFrame (DatetimeIndex × tickers)
+  - Return a signal DataFrame of the same shape
+  - Apply .shift(1) internally so there is NO look-ahead bias
+    (signal generated at close of day T is applied at open of day T+1)
 """
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 
-# ═══════════════════════════════════════════════════════════════
-#  MOMENTUM SIGNALS
-# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
+#  1 — CROSS-SECTIONAL MOMENTUM  (Jegadeesh & Titman 1993)
+# ═══════════════════════════════════════════════════════════════════════════
 
 def cross_sectional_momentum(
-    prices: pd.DataFrame,
-    lookback: int = 252,
-    skip_last: int = 21,
-    n_long: int = 5,
-    n_short: int = 5
+    prices:    pd.DataFrame,
+    lookback:  int   = 252,
+    skip_last: int   = 21,
+    n_long:    int   = 10,
+    n_short:   int   = 10,
 ) -> pd.DataFrame:
     """
-    Classic Jegadeesh-Titman (1993) cross-sectional momentum.
-    
-    At each date:
-      1. Compute trailing return over [t - lookback, t - skip_last]
-         (skip last month to avoid short-term reversal contamination)
-      2. Rank stocks; go long top-n_long, short bottom-n_short
-      3. Equal-weight within long/short legs
-    
-    Returns: signal DataFrame with values in {-1, 0, +1}
+    Rank all stocks by their formation-period return, go equal-weight long
+    in the top n_long and equal-weight short in the bottom n_short.
+
+    skip_last: skip the most recent `skip_last` days before measuring
+    the formation return to avoid the well-documented 1-month reversal
+    contaminating the 12-month momentum signal.
+
+    Parameters
+    ----------
+    prices    : adjusted close price DataFrame
+    lookback  : formation window in trading days (default 252 ≈ 12 months)
+    skip_last : days to skip at the end of the formation period (default 21 ≈ 1 month)
+    n_long    : number of stocks in the long leg
+    n_short   : number of stocks in the short leg
+
+    Returns
+    -------
+    Signal DataFrame with values in {+1/n_long, 0, -1/n_short}.
+    Shifted by 1 day (no look-ahead).
     """
-    # Step 1: compute formation-period returns
-    formation_return = prices.shift(skip_last) / prices.shift(lookback) - 1
+    formation_ret = prices.shift(skip_last) / prices.shift(lookback) - 1
 
-    signals = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+    ranked  = formation_ret.rank(axis=1, ascending=False, method="first")
+    n_valid = formation_ret.notna().sum(axis=1)
 
-    for date in prices.index[lookback:]:
-        row = formation_return.loc[date].dropna()
-        if len(row) < n_long + n_short:
-            continue
+    signal = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
 
-        ranked = row.rank(ascending=False)
-        longs  = ranked[ranked <= n_long].index
-        shorts = ranked[ranked > len(row) - n_short].index
+    long_mask  = ranked.le(n_long)
+    short_mask = ranked.ge(n_valid.values.reshape(-1, 1) - n_short + 1)
 
-        signals.loc[date, longs]  =  1.0 / n_long
-        signals.loc[date, shorts] = -1.0 / n_short
+    signal[long_mask]  =  1.0 / n_long
+    signal[short_mask] = -1.0 / n_short
 
-    return signals
+    # Zero out rows with insufficient stocks
+    signal[n_valid < (n_long + n_short)] = 0.0
 
+    return signal.shift(1).fillna(0.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  2 — TIME-SERIES MOMENTUM  (Moskowitz, Ooi & Pedersen 2012)
+# ═══════════════════════════════════════════════════════════════════════════
 
 def time_series_momentum(
-    prices: pd.DataFrame,
-    lookback: int = 252
+    prices:   pd.DataFrame,
+    lookback: int = 252,
 ) -> pd.DataFrame:
     """
-    Time-series momentum (Moskowitz, Ooi, Pedersen 2012).
-    If trailing 12-month return is positive → long (+1), else short (-1).
-    Applied independently to each asset.
+    Each asset independently: long if trailing 12-month return > 0, short otherwise.
+    Positions are inverse-volatility scaled (down-weight high-vol assets).
+
+    Returns
+    -------
+    Continuous signal DataFrame (not ±1 — normalise with signal_to_positions).
+    Shifted by 1 day.
     """
-    trailing_return = prices / prices.shift(lookback) - 1
-    signals = np.sign(trailing_return).shift(1)  # shift 1 to avoid look-ahead
-    return signals.fillna(0)
+    trailing_ret = prices / prices.shift(lookback) - 1
+    direction    = np.sign(trailing_ret)
+
+    # 63-day rolling vol for inverse-vol scaling
+    log_ret      = np.log(prices / prices.shift(1))
+    rolling_vol  = log_ret.rolling(63).std() * np.sqrt(252)
+    inv_vol      = 1.0 / rolling_vol.replace(0, np.nan)
+
+    signal = direction * inv_vol
+    return signal.shift(1).fillna(0.0)
 
 
-def moving_average_crossover(
-    prices: pd.DataFrame,
-    fast: int = 50,
-    slow: int = 200
+# ═══════════════════════════════════════════════════════════════════════════
+#  3 — Z-SCORE MEAN-REVERSION
+# ═══════════════════════════════════════════════════════════════════════════
+
+def zscore_mean_reversion(
+    prices:   pd.DataFrame,
+    lookback: int   = 20,
+    entry_z:  float = 1.5,
+    exit_z:   float = 0.5,
 ) -> pd.DataFrame:
     """
-    Golden/death cross momentum signal.
-    +1 when fast MA > slow MA, -1 otherwise.
+    Short-term reversal based on rolling z-score.
+
+    z = (price − rolling_mean) / rolling_std
+
+    z < −entry_z  →  Long  (+1)   oversold
+    z >  entry_z  →  Short (−1)   overbought
+    |z| <  exit_z →  Flat  (0)    no signal
+
+    Parameters
+    ----------
+    lookback : rolling window for mean/std (default 20 ≈ 1 month)
+    entry_z  : z-score threshold to enter a position
+    exit_z   : z-score threshold to flatten (not used in current binary
+                implementation but kept for extension)
+
+    Returns
+    -------
+    Signal DataFrame with values in {+1, 0, −1}.
+    Shifted by 1 day.
+    """
+    roll_mean = prices.rolling(lookback).mean()
+    roll_std  = prices.rolling(lookback).std().replace(0, np.nan)
+    z         = (prices - roll_mean) / roll_std
+
+    signal = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
+    signal[z < -entry_z] =  1.0
+    signal[z >  entry_z] = -1.0
+
+    return signal.shift(1).fillna(0.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  4 — MA CROSSOVER  (bonus strategy)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def ma_crossover(
+    prices: pd.DataFrame,
+    fast:   int = 50,
+    slow:   int = 200,
+) -> pd.DataFrame:
+    """
+    Golden / death cross: long when fast MA > slow MA, short otherwise.
+
+    Returns
+    -------
+    Signal DataFrame with values in {+1, −1}.
+    Shifted by 1 day.
     """
     fast_ma = prices.rolling(fast).mean()
     slow_ma = prices.rolling(slow).mean()
-    signals = np.sign(fast_ma - slow_ma).shift(1).fillna(0)
-    return signals
+    signal  = np.sign(fast_ma - slow_ma)
+    return signal.shift(1).fillna(0.0)
 
 
-# ═══════════════════════════════════════════════════════════════
-#  MEAN-REVERSION SIGNALS
-# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
+#  UTILITIES
+# ═══════════════════════════════════════════════════════════════════════════
 
-def zscore_mean_reversion(
-    prices: pd.DataFrame,
-    lookback: int = 20,
-    entry_z: float = 1.5,
-    exit_z: float = 0.5
+def signal_to_positions(
+    signals:   pd.DataFrame,
+    max_gross: float = 1.0,
 ) -> pd.DataFrame:
     """
-    Short-term mean-reversion using rolling z-score.
-    
-    z = (price - rolling_mean) / rolling_std
-    
-    Signal:
-      z < -entry_z  → Long  (+1)   [oversold]
-      z >  entry_z  → Short (-1)   [overbought]
-      |z| < exit_z  → Flat  ( 0)   [exit zone]
+    Normalise a signal DataFrame so each row's gross exposure equals max_gross.
+    Rows with zero signal remain zero.
+
+    Parameters
+    ----------
+    signals   : raw signal DataFrame (any numeric values)
+    max_gross : target gross exposure per day (default 1.0 = 100 % of capital)
+
+    Returns
+    -------
+    Position-weight DataFrame summing to max_gross in absolute value per row.
     """
-    rolling_mean = prices.rolling(lookback).mean()
-    rolling_std  = prices.rolling(lookback).std()
-    z = (prices - rolling_mean) / rolling_std
+    abs_sum   = signals.abs().sum(axis=1).replace(0, np.nan)
+    positions = signals.div(abs_sum, axis=0) * max_gross
+    return positions.fillna(0.0)
 
-    signals = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
-    signals[z < -entry_z] =  1.0   # oversold → buy
-    signals[z >  entry_z] = -1.0   # overbought → sell
-    signals = signals.shift(1).fillna(0)  # avoid look-ahead
-    return signals
-
-
-def rsi_mean_reversion(
-    prices: pd.DataFrame,
-    period: int = 14,
-    oversold: float = 30,
-    overbought: float = 70
-) -> pd.DataFrame:
-    """
-    RSI-based mean-reversion.
-    RSI < oversold  → Long
-    RSI > overbought → Short
-    """
-    delta = prices.diff()
-    gain  = delta.clip(lower=0).rolling(period).mean()
-    loss  = (-delta.clip(upper=0)).rolling(period).mean()
-    rs    = gain / loss.replace(0, np.nan)
-    rsi   = 100 - (100 / (1 + rs))
-
-    signals = pd.DataFrame(0.0, index=prices.index, columns=prices.columns)
-    signals[rsi < oversold]   =  1.0
-    signals[rsi > overbought] = -1.0
-    return signals.shift(1).fillna(0)
-
-
-# ═══════════════════════════════════════════════════════════════
-#  SIGNAL UTILITIES
-# ═══════════════════════════════════════════════════════════════
 
 def combine_signals(
-    signal_list: list[pd.DataFrame],
-    weights: list[float] | None = None
+    signal_list: list,
+    weights:     list = None,
 ) -> pd.DataFrame:
     """
     Linearly combine multiple signal DataFrames.
-    If weights=None, equal-weights all signals.
+    If weights=None, equal-weights all inputs.
     """
     if weights is None:
         weights = [1.0 / len(signal_list)] * len(signal_list)
-    combined = sum(w * s for w, s in zip(weights, signal_list))
-    return combined
-
-
-def signal_to_positions(
-    signals: pd.DataFrame,
-    max_position: float = 1.0
-) -> pd.DataFrame:
-    """
-    Normalise signal DataFrame so row absolute values sum to max_position.
-    Handles zero-signal rows gracefully.
-    """
-    abs_sum = signals.abs().sum(axis=1).replace(0, np.nan)
-    positions = signals.div(abs_sum, axis=0) * max_position
-    return positions.fillna(0)
+    return sum(w * s for w, s in zip(weights, signal_list))
