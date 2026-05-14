@@ -1,70 +1,132 @@
-# backtester/data_loader.py
 """
-Fetch and cache OHLCV data using yfinance.
-Supports S&P 500 (via SPY components or a curated list)
-and NIFTY 50 symbols.
+backtester/data_loader.py
+
+Downloads and caches adjusted close prices for the full 100-stock universe
+(90 US tickers + 10 NIFTY 50 names) used in the backtesting notebook.
 """
 
-import yfinance as yf
-import pandas as pd
 import numpy as np
+import pandas as pd
+import yfinance as yf
 from pathlib import Path
 import logging
 
 logger = logging.getLogger(__name__)
 
-# ── A curated 20-stock universe (extend as needed) ─────────────
-SP500_UNIVERSE = [
+# ── Full 100-stock universe (matches notebook exactly) ─────────────────────
+TICKERS = [
+    # Tech / Mega-cap
     "AAPL", "MSFT", "GOOGL", "AMZN", "META",
-    "NVDA", "JPM", "GS", "BAC", "MS",
-    "XOM", "CVX", "JNJ", "PFE", "UNH",
-    "WMT", "PG", "KO", "SPY", "QQQ"
+    "NVDA", "TSLA", "JPM",  "GS",   "BAC",
+    "MS",   "AMD",  "NFLX", "AVGO", "ORCL",
+    "CRM",  "ADBE", "CSCO", "QCOM", "INTC",
+    "IBM",  "NOW",  "UBER", "PLTR", "SHOP",
+    # Consumer
+    "WMT",  "COST", "HD",   "LOW",  "NKE",
+    "KO",   "PEP",  "MCD",  "SBUX", "DIS",
+    # Energy
+    "XOM",  "CVX",  "SLB",  "COP",  "EOG",
+    # Healthcare
+    "JNJ",  "PFE",  "MRK",  "ABBV", "UNH",
+    "LLY",  "TMO",  "DHR",  "ABT",  "BMY",
+    # ETFs (sector + broad market)
+    "SPY",  "QQQ",  "IWM",  "DIA",  "XLK",
+    "XLF",  "XLE",  "XLV",  "XLY",  "XLP",
+    # Industrials / Defence
+    "CAT",  "DE",   "GE",   "HON",  "RTX",
+    "LMT",  "BA",   "MMM",  "UPS",  "FDX",
+    # Telecom / Media
+    "T",    "VZ",   "TMUS", "CMCSA","CHTR",
+    # Financials / Payments
+    "V",    "MA",   "PYPL", "AXP",  "BLK",
+    "SCHW", "C",    "BK",   "USB",  "PNC",
+    # NIFTY 50 (India)
+    "RELIANCE.NS", "TCS.NS",      "INFY.NS",
+    "HDFCBANK.NS", "ICICIBANK.NS","SBIN.NS",
+    "ITC.NS",      "LT.NS",       "BHARTIARTL.NS", "AXISBANK.NS",
 ]
 
-NIFTY50_UNIVERSE = [
-    "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
-    "HINDUNILVR.NS", "ITC.NS", "SBIN.NS", "BHARTIARTL.NS", "BAJFINANCE.NS",
-    "KOTAKBANK.NS", "LT.NS", "HCLTECH.NS", "ASIANPAINT.NS", "AXISBANK.NS"
-]
+START = "2015-01-01"
+END   = "2024-12-31"
 
 
 def fetch_prices(
-    tickers: list[str],
-    start: str = "2015-01-01",
-    end: str = "2024-12-31",
+    tickers: list = TICKERS,
+    start:   str  = START,
+    end:     str  = END,
     cache_dir: str = "data/",
-    field: str = "Adj Close"
 ) -> pd.DataFrame:
     """
-    Download adjusted close prices and cache locally as parquet.
-    Returns a DataFrame with dates as index, tickers as columns.
+    Download adjusted close prices and cache as parquet.
+    Subsequent calls load from disk — no re-download needed.
+
+    Returns
+    -------
+    pd.DataFrame
+        DatetimeIndex rows, ticker columns.
+        Forward-filled up to 10 days; no NaNs remaining.
     """
-    cache_path = Path(cache_dir) / f"prices_{'_'.join(tickers[:3])}_{start[:4]}_{end[:4]}.parquet"
+    cache_path = Path(cache_dir) / "prices_100stocks_2015_2024.parquet"
     cache_path.parent.mkdir(parents=True, exist_ok=True)
 
     if cache_path.exists():
         logger.info(f"Loading from cache: {cache_path}")
         return pd.read_parquet(cache_path)
 
-    logger.info(f"Downloading {len(tickers)} tickers from yfinance...")
-    raw = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)
+    logger.info(f"Downloading {len(tickers)} tickers ({start} → {end}) ...")
+    raw = yf.download(
+        tickers,
+        start=start,
+        end=end,
+        auto_adjust=True,
+        progress=True,
+        threads=True,
+    )
 
-    # yfinance returns MultiIndex columns when multiple tickers
-    if isinstance(raw.columns, pd.MultiIndex):
-        prices = raw["Close"]
-    else:
-        prices = raw[["Close"]].rename(columns={"Close": tickers[0]})
-
-    prices = prices.dropna(how="all")
+    prices = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw[["Close"]]
+    prices.index = pd.to_datetime(prices.index)
     prices.to_parquet(cache_path)
-    logger.info(f"Saved to {cache_path}")
+    logger.info(f"Cached to {cache_path}")
     return prices
 
 
-def compute_returns(prices: pd.DataFrame, method: str = "log") -> pd.DataFrame:
+def clean_prices(
+    df: pd.DataFrame,
+    min_history_pct: float = 0.6,
+    max_gap_days:    int   = 10,
+) -> tuple:
     """
-    Compute daily returns from price series.
-    method: 'log' (log returns) or 'simple' (pct change)
+    1. Drop tickers with < min_history_pct of trading days populated.
+    2. Forward-fill short gaps (holidays, halts) up to max_gap_days.
+    3. Drop dates where >50 % of universe has no data.
+    4. Final ffill + bfill to remove any remaining NaNs.
+
+    Returns (clean_df, dropped_tickers).
+    """
+    min_days = int(len(df) * min_history_pct)
+    counts   = df.notna().sum()
+    keep     = counts[counts >= min_days].index.tolist()
+    dropped  = counts[counts <  min_days].index.tolist()
+
+    clean = df[keep].ffill(limit=max_gap_days)
+    clean = clean[clean.notna().mean(axis=1) >= 0.5]
+    clean = clean.ffill().bfill()
+
+    assert clean.isna().sum().sum() == 0, "NaNs remain after cleaning"
+    return clean, dropped
+
+
+def compute_returns(
+    prices: pd.DataFrame,
+    method: str = "log",
+) -> pd.DataFrame:
+    """
+    Compute daily returns.
+
+    Parameters
+    ----------
+    method : 'log'    → ln(P_t / P_{t-1})   — time-additive, used throughout
+             'simple' → (P_t / P_{t-1}) - 1  — for reference/plotting
     """
     if method == "log":
         return np.log(prices / prices.shift(1)).dropna()
@@ -72,21 +134,28 @@ def compute_returns(prices: pd.DataFrame, method: str = "log") -> pd.DataFrame:
 
 
 def load_universe(
-    universe: str = "sp500",
-    start: str = "2015-01-01",
-    end: str = "2024-12-31"
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Convenience function. Returns (prices, log_returns)."""
-    tickers = SP500_UNIVERSE if universe == "sp500" else NIFTY50_UNIVERSE
-    prices = fetch_prices(tickers, start=start, end=end)
-    returns = compute_returns(prices, method="log")
-    return prices, returns
+    tickers:   list = TICKERS,
+    start:     str  = START,
+    end:       str  = END,
+    cache_dir: str  = "data/",
+) -> tuple:
+    """
+    Convenience loader used by run_backtest.py and notebooks.
+
+    Returns
+    -------
+    (prices, log_returns, dropped_tickers)
+    """
+    raw              = fetch_prices(tickers, start, end, cache_dir)
+    prices, dropped  = clean_prices(raw)
+    log_returns      = compute_returns(prices, method="log")
+    return prices, log_returns, dropped
 
 
-# ── Quick test ─────────────────────────────────────────────────
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    prices, returns = load_universe("sp500", "2018-01-01", "2024-12-31")
-    print(prices.tail())
-    print(f"\nShape: {prices.shape}")
-    print(f"Missing values: {prices.isna().sum().sum()}")
+    prices, returns, dropped = load_universe()
+    print(f"Universe  : {prices.shape[1]} tickers  |  {prices.shape[0]} trading days")
+    print(f"Date range: {prices.index[0].date()} → {prices.index[-1].date()}")
+    print(f"Dropped   : {dropped}")
+    print(returns.describe().round(5))
