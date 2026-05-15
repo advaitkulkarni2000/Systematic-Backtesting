@@ -1,0 +1,5 @@
+Label,Ann. Return (%),Ann. Vol (%),Sharpe Ratio,Sortino Ratio,Calmar Ratio,Max Drawdown (%),VaR 95% (daily %),CVaR 95% (daily %),Hit Rate (%),Avg Daily Turnover,Final PnL ($M),Total Trading Days
+XS Momentum (12M),1.53,12.43,0.123,0.149,0.048,-31.91,-1.261,-1.971,46.6,0.1213,1.08,2588
+TS Momentum (12M),2.93,8.25,0.355,0.388,0.149,-19.71,-0.78,-1.338,49.0,0.0542,1.304,2588
+Z-Score Mean-Rev (20D),-15.53,16.5,-0.941,-1.214,-0.182,-85.27,-1.332,-2.365,42.27,0.8928,0.176,2588
+SPY Buy & Hold,11.94,17.43,0.685,0.799,0.334,-35.75,-1.667,-2.727,53.05,0.0004,2.913,2588
