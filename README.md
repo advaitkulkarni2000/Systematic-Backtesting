@@ -15,13 +15,11 @@ the academic literature cited below.*
 
 | Strategy | Ann. Return | Ann. Vol | Sharpe | Sortino | Max DD | OOS Sharpe |
 |---|---|---|---|---|---|---|
-| XS Momentum (12M) | **X.XX%** | X.XX% | **X.XXX** | X.XXX | −XX.X% | X.XXX |
-| TS Momentum (12M) | X.XX% | X.XX% | X.XXX | X.XXX | −XX.X% | — |
-| Z-Score Mean-Rev (20D) | X.XX% | X.XX% | X.XXX | X.XXX | −XX.X% | — |
-| SPY Buy & Hold | X.XX% | X.XX% | X.XXX | X.XXX | −XX.X% | — |
+| XS Momentum (12M) | **1.53%** | 12.43% | **0.123** | 0.149 | −31.91% | 0.201 |
+| TS Momentum (12M) | 2.93% | 8.25% | 0.355 | 0.388 | −19.71% | — |
+| Z-Score Mean-Rev (20D) | -15.53% | 16.5% |-0.941 | -1.214 | −85.27% | — |
+| SPY Buy & Hold | 11.94% | 17.23% | 0.799 | 0.334 | −35.75% | — |
 
-> Fill in the table above with your actual numbers from `results/strategy_comparison.csv`
-> and `results/walkforward_is_vs_oos.csv` after running the notebook.
 
 ---
 
