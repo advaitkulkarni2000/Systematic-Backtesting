@@ -153,4 +153,4 @@ jupyter notebook systematic_backtester.ipynb
 
 ---
 
-*Author: Advait Kulkarni | Imperial College London MSc Applied Machine Learning 2025–2026* | "Companion project: LLM Evaluation Harness"
+*Author: Advait Kulkarni | Imperial College London MSc Applied Machine Learning 2025–2026* | *Companion project: [LLM Evaluation Harness](https://github.com/advaitkulkarni2000/LLM-EVALUATION-HARNESS)*
